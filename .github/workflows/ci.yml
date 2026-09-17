@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ".[dev]"
+      - name: Lint production integration paths
+        run: >-
+          ruff check
+          src/incidentrag/api
+          src/incidentrag/approval/ui
+          src/incidentrag/sources
+          src/incidentrag/core/ai_provider.py
+          src/incidentrag/retrieval/reranker.py
+          src/incidentrag/cli.py
+          tests/unit/test_github_api.py
+          tests/unit/test_github_source.py
+          tests/unit/test_ui_api_client.py
+      - run: pytest tests/unit -q --no-cov
+      - run: docker build -t incidentrag-api:test .
+      - run: docker build -f Dockerfile.ui -t incidentrag-ui:test .

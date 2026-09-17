@@ -1,0 +1,13 @@
+.git
+.venv
+.env
+.pytest_cache
+.mypy_cache
+.ruff_cache
+references
+data-gym-cache
+__pycache__
+*.pyc
+*.log
+coverage.xml
+.coverage

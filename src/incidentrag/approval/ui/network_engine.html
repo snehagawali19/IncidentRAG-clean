@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>IncidentRAG network</title>
+<style>
+  :root {
+    --bg: #05070b;
+    --ink: #d7e6ff;
+    --muted: #7f91b3;
+    --cyan: #5ce1ff;
+    --violet: #b48cff;
+    --amber: #ffc46b;
+    --rose: #ff6b8a;
+    --lime: #7dffb3;
+  }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: "Segoe UI", "IBM Plex Sans", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .hud, .panel, .toolbar, .badge {
+    position: absolute; z-index: 3; pointer-events: none;
+  }
+  .hud {
+    left: 24px; top: 22px; font-size: 10px; letter-spacing: .2em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .hud strong { color: var(--cyan); font-weight: 650; }
+  .credit {
+    position: absolute; right: 22px; bottom: 18px; z-index: 3;
+    font-size: 11px; letter-spacing: .12em; color: #5c6d8c; pointer-events: none;
+  }
+  .toolbar {
+    left: 22px; bottom: 18px; display: flex; gap: 8px; pointer-events: auto;
+  }
+  .toolbar button {
+    background: rgba(12,18,32,.68); color: var(--ink); border: 1px solid rgba(156,211,240,.22);
+    border-radius: 999px; padding: 7px 12px; font-size: 11px; letter-spacing: .08em;
+    cursor: pointer;
+  }
+  .toolbar button:hover { border-color: var(--cyan); color: var(--cyan); }
+  .panel {
+    top: 22px; right: 22px; width: min(360px, 42vw); max-height: calc(100% - 44px);
+    overflow: auto; pointer-events: auto; padding: 16px 16px 18px;
+    background: linear-gradient(140deg, rgba(20,31,50,.78), rgba(7,11,20,.75));
+    border: 1px solid rgba(154,222,246,.24); border-radius: 18px;
+    box-shadow: 0 18px 50px rgba(0,0,0,.35); transform: translateX(24px);
+    opacity: 0; transition: opacity .35s ease, transform .35s ease;
+  }
+  .panel.open { opacity: 1; transform: none; }
+  .panel h2 {
+    margin: 0 0 10px; font-size: 13px; letter-spacing: .2em; color: var(--cyan);
+  }
+  .panel .field { margin: 0 0 12px; }
+  .panel .k { font-size: 10px; letter-spacing: .16em; color: var(--muted); text-transform: uppercase; }
+  .panel .v { margin-top: 4px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
+  .tooltip {
+    position: absolute; z-index: 4; pointer-events: none; display: none;
+    background: rgba(8,12,22,.94); border: 1px solid rgba(92,225,255,.28);
+    padding: 8px 10px; border-radius: 8px; font-size: 12px; min-width: 140px;
+  }
+  .badge {
+    top: 16px; left: 50%; transform: translateX(-50%);
+    border: 1px solid rgba(255,107,138,.45); color: var(--rose);
+    padding: 5px 12px; border-radius: 999px; font-size: 10px; letter-spacing: .18em;
+    background: rgba(40,8,16,.55); display: none;
+  }
+  .badge.show { display: block; }
+</style>
+</head>
+<body>
+<canvas id="net"></canvas>
+<div class="hud"><strong id="modeLabel">NETWORK</strong><div id="modeHint">Pointer proximity influences local field</div></div>
+<div class="badge" id="approvalBadge">HUMAN APPROVAL REQUIRED</div>
+<aside class="panel" id="panel"></aside>
+<div class="tooltip" id="tip"></div>
+<div class="toolbar">
+  <button type="button" id="resetBtn">Reset view</button>
+  <button type="button" id="focusBtn">Clear focus</button>
+</div>
+<div class="credit">Created by SG</div>
+<script>
+const PAYLOAD = __PAYLOAD__;
+const canvas = document.getElementById("net");
+const ctx = canvas.getContext("2d");
+const tip = document.getElementById("tip");
+const panel = document.getElementById("panel");
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const mobile = innerWidth < 740;
+const mode = PAYLOAD.mode || "idle";
+document.getElementById("modeLabel").textContent =
+  mode === "analysis" ? "ANALYSIS NETWORK" : mode === "assessment" ? "ASSESSMENT GRAPH" : "INCIDENT FIELD";
+document.getElementById("modeHint").textContent =
+  mode === "analysis"
+    ? "Constructing a conceptual knowledge graph around the incident"
+    : mode === "assessment"
+      ? "Explore evidence, hypotheses, and investigation paths"
+      : "Select an incident as the origin node";
+if (PAYLOAD.meta && PAYLOAD.meta.human_approval_required) {
+  document.getElementById("approvalBadge").classList.add("show");
+}
+
+let W = 0, H = 0, dpr = 1, cam = { x: 0, y: 0, s: 1 };
+let mx = 0, my = 0, hovering = null, selected = null, dragging = false, last = { x: 0, y: 0 };
+let t0 = performance.now(), hidden = document.hidden;
+const nodes = [];
+const edges = [];
+const packets = [];
+const particles = [];
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+function hash(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
+function kindColor(kind, risk) {
+  if (kind === "approval" || kind === "risk") return [255, 107, 138];
+  if (kind === "hypothesis") return [180, 140, 255];
+  if (kind === "evidence") return [255, 196, 107];
+  if (kind === "investigation") return [124, 210, 255];
+  if (kind === "confidence" || kind === "assessment") return [125, 255, 179];
+  if (kind === "incident") return [92, 225, 255];
+  if (kind === "process") return [110, 170, 255];
+  if (String(risk).toLowerCase() === "critical" || String(risk).toLowerCase() === "dangerous") return [255, 80, 90];
+  return [90, 130, 180];
+}
+
+function restPosition(node, i, n) {
+  const cx = 0, cy = 0;
+  if (node.kind === "incident") return { x: cx, y: cy - 40 };
+  if (node.kind === "assessment") return { x: cx, y: cy + 70 };
+  if (node.kind === "confidence") return { x: cx + 210, y: cy + 20 };
+  if (node.kind === "risk") return { x: cx + 250, y: cy - 70 };
+  const groups = {
+    process: { r: 150, a0: -Math.PI * 0.15 },
+    signal: { r: 220, a0: 0.4 },
+    evidence: { r: 175, a0: Math.PI * 0.82 },
+    hypothesis: { r: 165, a0: -0.35 },
+    investigation: { r: 250, a0: 0.95 },
+    approval: { r: 280, a0: 0.15 },
+    remediation: { r: 270, a0: 0.2 },
+  };
+  const g = groups[node.kind] || { r: 190, a0: i };
+  const siblings = nodes.filter((x) => x.kind === node.kind);
+  const idx = siblings.indexOf(node);
+  const spread = Math.max(siblings.length, 1);
+  const a = g.a0 + (idx - (spread - 1) / 2) * (0.42 + (spread > 5 ? 0.08 : 0.18));
+  return { x: Math.cos(a) * g.r, y: Math.sin(a) * g.r * 0.72 };
+}
+
+PAYLOAD.nodes.forEach((raw, i) => {
+  const z = ((hash(raw.id) % 100) / 100) * 0.8;
+  nodes.push({
+    ...raw,
+    x: 0, y: 0, vx: 0, vy: 0, z,
+    born: i * (mode === "analysis" ? 420 : 90),
+    visible: 0,
+    pulse: Math.random() * Math.PI * 2,
+  });
+});
+const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
+PAYLOAD.edges.forEach((e) => {
+  if (byId[e.source] && byId[e.target]) edges.push({ ...e, glow: 0 });
+});
+nodes.forEach((n, i) => {
+  const p = restPosition(n, i, nodes.length);
+  n.tx = p.x; n.ty = p.y;
+  n.x = p.x * (mode === "assessment" ? 0.2 : 0.05);
+  n.y = p.y * (mode === "assessment" ? 0.2 : 0.05);
+});
+
+function particleCap() {
+  if (reduced) return 0;
+  if (mobile) return 28;
+  return mode === "analysis" ? 90 : 55;
+}
+
+function spawnPacket(edge) {
+  if (reduced || packets.length > (mobile ? 10 : 28)) return;
+  packets.push({ e: edge, u: 0, speed: 0.004 + Math.random() * 0.006 });
+}
+
+function worldFromEvent(ev) {
+  const r = canvas.getBoundingClientRect();
+  const sx = ev.clientX - r.left, sy = ev.clientY - r.top;
+  return { x: (sx - W / 2) / cam.s - cam.x, y: (sy - H / 2) / cam.s - cam.y, sx, sy };
+}
+
+function nodeRadius(n) {
+  const base = n.kind === "incident" ? 22 : n.kind === "signal" ? 4.5 : 9 + (n.weight || 0.5) * 8;
+  return base * (1.12 - n.z * 0.15);
+}
+
+function pick(wx, wy) {
+  let best = null, bd = 1e9;
+  for (const n of nodes) {
+    if (n.visible < 0.2) continue;
+    const d = Math.hypot(n.x - wx, n.y - wy);
+    const hit = nodeRadius(n) + 10;
+    if (d < hit && d < bd) { bd = d; best = n; }
+  }
+  return best;
+}
+
+function neighbors(id) {
+  const set = new Set([id]);
+  for (const e of edges) {
+    if (e.source === id) set.add(e.target);
+    if (e.target === id) set.add(e.source);
+  }
+  return set;
+}
+
+function openPanel(n) {
+  if (!n || !n.detail) { panel.classList.remove("open"); return; }
+  const fields = (n.detail.fields || [])
+    .filter((f) => String(f.value || "").trim())
+    .map((f) => `<div class="field"><div class="k">${esc(f.label)}</div><div class="v">${esc(f.value)}</div></div>`)
+    .join("");
+  panel.innerHTML = `<h2>${esc(n.detail.title || n.label)}</h2>${fields || "<div class='v'>No additional fields returned.</div>"}`;
+  panel.classList.add("open");
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+canvas.addEventListener("pointermove", (ev) => {
+  const w = worldFromEvent(ev);
+  mx = w.x; my = w.y;
+  if (dragging) {
+    cam.x += (ev.clientX - last.x) / cam.s;
+    cam.y += (ev.clientY - last.y) / cam.s;
+    last = { x: ev.clientX, y: ev.clientY };
+    return;
+  }
+  hovering = pick(w.x, w.y);
+  canvas.style.cursor = hovering ? "pointer" : "crosshair";
+  if (hovering && hovering.label) {
+    tip.style.display = "block";
+    tip.style.left = w.sx + 14 + "px";
+    tip.style.top = w.sy + 14 + "px";
+    const extra = [];
+    if (hovering.sublabel) extra.push(hovering.sublabel);
+    if (hovering.relevance) extra.push("Relevance " + hovering.relevance);
+    if (typeof hovering.confidence === "number") extra.push("Confidence " + Math.round(hovering.confidence * 100) + "%");
+    tip.innerHTML = `<strong>${esc(hovering.label)}</strong><div>${esc(extra.join(" · "))}</div>`;
+  } else tip.style.display = "none";
+});
+canvas.addEventListener("pointerdown", (ev) => {
+  const w = worldFromEvent(ev);
+  const n = pick(w.x, w.y);
+  if (n) {
+    selected = n;
+    openPanel(n);
+    n.vx += (0 - n.x) * 0.01;
+    n.vy += ((mode === "assessment" ? -20 : 0) - n.y) * 0.01;
+  } else {
+    dragging = true;
+    last = { x: ev.clientX, y: ev.clientY };
+  }
+});
+addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  cam.s = Math.min(2.2, Math.max(0.55, cam.s * (ev.deltaY > 0 ? 0.94 : 1.06)));
+}, { passive: false });
+document.getElementById("resetBtn").onclick = () => { cam = { x: 0, y: 0, s: 1 }; selected = null; panel.classList.remove("open"); };
+document.getElementById("focusBtn").onclick = () => { selected = null; panel.classList.remove("open"); };
+document.addEventListener("visibilitychange", () => { hidden = document.hidden; });
+
+let lastPacket = 0;
+function evolve(now, dt) {
+  const elapsed = (now - t0) / 1000;
+  const focus = selected ? neighbors(selected.id) : null;
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    let appearAt = n.born;
+    if (mode === "analysis") {
+      if (elapsed < 3) appearAt = n.kind === "incident" || (n.kind === "process" && i < 4) ? n.born : 1e9;
+      else if (elapsed < 8) appearAt = n.kind === "signal" && i % 3 === 0 ? n.born + 1200 : n.born;
+      else if (elapsed < 15) appearAt = n.born;
+      else appearAt = n.born;
+    } else {
+      appearAt = n.born;
+    }
+    const should = reduced || now - t0 > appearAt;
+    n.visible += ((should ? 1 : 0) - n.visible) * (reduced ? 1 : 0.04);
+    if (mode === "analysis" && elapsed > 15 && n.kind === "signal" && i % 4 === 0) {
+      n.visible *= elapsed > 25 ? 0.65 : 0.85;
+    }
+    const restx = n.tx, resty = n.ty;
+    let fx = (restx - n.x) * 0.035, fy = (resty - n.y) * 0.035;
+    for (let j = i + 1; j < nodes.length; j++) {
+      const o = nodes[j];
+      let dx = n.x - o.x, dy = n.y - o.y;
+      let d2 = dx * dx + dy * dy + 40;
+      const f = 420 / d2;
+      dx *= f; dy *= f;
+      n.vx += dx * dt; n.vy += dy * dt;
+      o.vx -= dx * dt; o.vy -= dy * dt;
+    }
+    const pdx = n.x - mx, pdy = n.y - my;
+    const pd = Math.hypot(pdx, pdy) + 1;
+    if (pd < 90) {
+      const mag = (90 - pd) / 90 * 8;
+      fx += (pdx / pd) * mag;
+      fy += (pdy / pd) * mag;
+    }
+    if (focus && !focus.has(n.id)) { fx *= 0.4; fy *= 0.4; }
+    n.vx = (n.vx + fx) * 0.86;
+    n.vy = (n.vy + fy) * 0.86;
+    if (!reduced) {
+      n.x += n.vx;
+      n.y += n.vy;
+      n.x += Math.sin(now / 900 + n.pulse) * 0.08;
+      n.y += Math.cos(now / 1100 + n.z) * 0.07;
+    } else {
+      n.x = restx; n.y = resty;
+    }
+  }
+  if (!reduced && now - lastPacket > (mode === "analysis" ? 220 : 420)) {
+    const live = edges.filter((e) => byId[e.source].visible > 0.5 && byId[e.target].visible > 0.5);
+    if (live.length) spawnPacket(live[Math.floor(Math.random() * live.length)]);
+    lastPacket = now;
+  }
+  if (!reduced && particles.length < particleCap() && Math.random() < 0.4) {
+    particles.push({
+      x: (Math.random() - 0.5) * 520, y: (Math.random() - 0.5) * 360,
+      vx: (Math.random() - 0.5) * 0.15, vy: (Math.random() - 0.5) * 0.12, a: Math.random(),
+    });
+  }
+}
+
+function drawGrid() {
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(cam.s, cam.s);
+  ctx.translate(cam.x, cam.y);
+  ctx.strokeStyle = "rgba(70,100,150,0.08)";
+  ctx.lineWidth = 1 / cam.s;
+  for (let i = -8; i <= 8; i++) {
+    ctx.beginPath(); ctx.moveTo(i * 48, -420); ctx.lineTo(i * 48, 420); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-480, i * 48); ctx.lineTo(480, i * 48); ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(92,225,255,0.08)";
+  for (let r = 60; r <= 300; r += 60) {
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function bezier(a, b) {
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const nx = -(b.y - a.y) * 0.18, ny = (b.x - a.x) * 0.18;
+  return { cx: mx + nx, cy: my + ny };
+}
+
+function draw() {
+  const now = performance.now();
+  ctx.fillStyle = "#05070d";
+  ctx.fillRect(0, 0, W, H);
+  const g = ctx.createRadialGradient(W * 0.5, H * 0.45, 20, W * 0.5, H * 0.5, Math.max(W, H) * 0.7);
+  g.addColorStop(0, "rgba(20,40,70,0.35)");
+  g.addColorStop(1, "rgba(5,7,13,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const risk = String((PAYLOAD.meta && PAYLOAD.meta.risk) || "").toLowerCase();
+  if (risk === "high" || risk === "dangerous" || risk === "sev1" || risk === "critical") {
+    ctx.fillStyle = "rgba(255,70,90,0.04)"; ctx.fillRect(0, 0, W, H);
+  } else if (risk === "medium" || risk === "sev2") {
+    ctx.fillStyle = "rgba(255,170,60,0.03)"; ctx.fillRect(0, 0, W, H);
+  }
+  drawGrid();
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(cam.s, cam.s);
+  ctx.translate(cam.x, cam.y);
+  const elapsed = (now - t0) / 1000;
+  if (!reduced && (mode === "analysis" && elapsed > 25)) {
+    ctx.rotate(Math.sin(now / 8000) * 0.03);
+  }
+
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.a -= 0.004;
+    ctx.fillStyle = `rgba(150,190,255,${Math.max(p.a, 0) * 0.25})`;
+    ctx.fillRect(p.x, p.y, 1.2, 1.2);
+  }
+  for (let i = particles.length - 1; i >= 0; i--) if (particles[i].a <= 0) particles.splice(i, 1);
+
+  const focus = selected ? neighbors(selected.id) : null;
+  for (const e of edges) {
+    const a = byId[e.source], b = byId[e.target];
+    const vis = Math.min(a.visible, b.visible);
+    if (vis < 0.05) continue;
+    const dim = focus && !(focus.has(a.id) && focus.has(b.id));
+    const c = kindColor(a.kind === "incident" ? b.kind : a.kind, a.risk);
+    const near = Math.min(Math.hypot(a.x - mx, a.y - my), Math.hypot(b.x - mx, b.y - my)) < 70;
+    const alpha = vis * (dim ? 0.12 : 0.42) * (near ? 1.4 : 1);
+    ctx.beginPath();
+    const bez = bezier(a, b);
+    ctx.moveTo(a.x, a.y);
+    ctx.quadraticCurveTo(bez.cx, bez.cy, b.x, b.y);
+    ctx.strokeStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+    ctx.lineWidth = (dim ? 0.7 : 1.35) / cam.s;
+    ctx.stroke();
+  }
+
+  for (const pk of packets) {
+    pk.u += pk.speed * (hovering ? 1.35 : 1);
+    const a = byId[pk.e.source], b = byId[pk.e.target];
+    const bez = bezier(a, b);
+    const t = pk.u;
+    const x = (1 - t) * (1 - t) * a.x + 2 * (1 - t) * t * bez.cx + t * t * b.x;
+    const y = (1 - t) * (1 - t) * a.y + 2 * (1 - t) * t * bez.cy + t * t * b.y;
+    ctx.beginPath();
+    ctx.fillStyle = "rgba(220,245,255,0.9)";
+    ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  for (let i = packets.length - 1; i >= 0; i--) if (packets[i].u >= 1) packets.splice(i, 1);
+
+  for (const n of nodes) {
+    if (n.visible < 0.02) continue;
+    const dim = focus && !focus.has(n.id);
+    const r = nodeRadius(n) * (hovering === n || selected === n ? 1.08 : 1);
+    const c = kindColor(n.kind, n.risk);
+    const alpha = n.visible * (dim ? 0.22 : 1);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    if (!reduced && (n.kind === "incident" || n.kind === "assessment")) {
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r + 10 + Math.sin(now / 400 + n.pulse) * 2, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(${c[0]},${c[1]},${c[2]},0.25)`;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r + 18, now / 700, now / 700 + 1.2);
+      ctx.strokeStyle = `rgba(${c[0]},${c[1]},${c[2]},0.45)`;
+      ctx.stroke();
+    }
+    if (n.kind === "approval") {
+      ctx.strokeStyle = "rgba(255,107,138,0.8)";
+      ctx.strokeRect(n.x - r - 8, n.y - r - 8, (r + 8) * 2, (r + 8) * 2);
+    }
+    const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r * 2.2);
+    grd.addColorStop(0, `rgba(${c[0]},${c[1]},${c[2]},0.95)`);
+    grd.addColorStop(0.45, `rgba(${c[0]},${c[1]},${c[2]},0.35)`);
+    grd.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(n.x, n.y, r * 2.1, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+    ctx.arc(n.x, n.y, r * 0.42, 0, Math.PI * 2); ctx.fill();
+    if (n.label && n.kind !== "signal") {
+      ctx.fillStyle = dim ? "rgba(180,200,230,0.35)" : "#e8f4ff";
+      ctx.font = `${n.kind === "incident" ? 12 : 10}px Segoe UI, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(n.label, n.x, n.y + r + 12);
+      if (n.sublabel && (hovering === n || selected === n || n.kind === "incident" || n.kind === "approval")) {
+        ctx.fillStyle = "rgba(127,145,179,0.9)";
+        ctx.font = "9px Segoe UI, sans-serif";
+        ctx.fillText(n.sublabel, n.x, n.y + r + 24);
+      }
+    }
+    ctx.restore();
+  }
+
+  if (mode === "analysis" && !reduced) {
+    const core = nodes.find((n) => n.kind === "incident");
+    if (core) {
+      ctx.beginPath();
+      ctx.arc(core.x, core.y, 36 + (elapsed % 4) * 10, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(92,225,255,${0.18 - (elapsed % 4) * 0.03})`;
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function loop(now) {
+  if (!hidden) {
+    evolve(now, 0.35);
+    draw();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

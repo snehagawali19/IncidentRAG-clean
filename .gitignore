@@ -1,0 +1,37 @@
+references/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+deploy/values-staging.yaml
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate*
+deploy/terraform/tfplan
+runs/
+.cache/
+
+# Local reports and runtime output
+.coverage
+coverage.xml
+current_test_run.txt
+test_results.txt
+phase1_baseline.txt
+*.log
+uvicorn.*.log
+pytest-of-root/
+data-gym-cache/
+
+# Local working snapshots and handoff material
+/final/
+/incidentrag/
+*.zip
+CARRYON.md
+PROJECT_HISTORY.txt
+PROJECT_STATE.txt
+transcript.md
